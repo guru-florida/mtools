@@ -1231,6 +1231,11 @@ except ImportError:
     MySQLdb = None
 
 try:
+    from influxdb import InfluxDBClient
+except ImportError:
+    influxdb = None
+    
+try:
     from sqlite3 import dbapi2 as sqlite
 except ImportError:
     sqlite = None
@@ -2910,6 +2915,99 @@ class MySQLConfigurator(MySQLClient):
             self.cleanup()
 
 
+class InfluxClient(object):
+    def __init__(self, host, user, passwd, database, table):
+        if not influxdb:
+            print 'InfluxDB Error: InfluxDB module could not be imported.'
+            sys.exit(1)
+
+        self.conn = None
+        self.db_host = host
+        self.db_user = user
+        self.db_passwd = passwd
+        self.db_database = database
+        self.db_table = self.db_database + '.' + table
+
+        infmsg('InfluxDB: host: %s' % self.db_host)
+        infmsg('InfluxDB: username: %s' % self.db_user)
+        infmsg('InfluxDB: database: %s' % self.db_database)
+        infmsg('InfluxDB: table: %s' % self.db_table)
+
+    def _open_connection(self):
+        dbgmsg('InfluxDB: opening connection to %s' % self.db_host)
+        self.conn = influxdb.InfluxDBClient(host=self.db_host, port=8086,
+                                    username=self.db_user,
+                                    password=self.db_passwd,
+                                    database=self.db_database)
+
+    def _close_connection(self):
+        if self.conn:
+            dbgmsg('InfluxDB: closing database connection')
+            self.conn.close()
+            self.conn = None
+
+    def setup(self):
+        self._open_connection()
+
+    def cleanup(self):
+        self._close_connection()
+
+class InfluxProcessor(DatabaseProcessor, InfluxClient):
+    def __init__(self, host, user, passwd, database, table, period,
+                 persistent_connection=False):
+        DatabaseProcessor.__init__(self, table, period)
+        InfluxClient.__init__(self, host, user, passwd, database, table)
+        self._tbl = table
+        self._persistent_connection = persistent_connection
+        infmsg('InfluxDB: process_period: %d' % self.process_period)
+
+    def setup(self):
+        cfg = InfluxConfigurator(self.db_host, self.db_user, self.db_passwd, self.db_database, self._tbl)
+        cfg.configure()
+        if self._persistent_connection:
+            InfluxClient.setup(self)
+
+    def cleanup(self):
+        if self._persistent_connection:
+            InfluxClient.cleanup(self)
+
+    def process_calculated(self, packets):
+        try:
+            if not self._persistent_connection:
+                InfluxClient.setup(self)
+            DatabaseProcessor.process_calculated(self, packets)
+        finally:
+            if not self._persistent_connection:
+                InfluxClient.cleanup(self)
+
+    def handle(self, e):
+        if type(e) == influxdb.Error:
+            errmsg('InfluxDB Error: [#%d] %s' % (e.args[0], e.args[1]))
+            return True
+        return super(InfluxProcessor, self).handle(e)
+
+
+class InfluxConfigurator(InfluxClient):
+    def __init__(self, host, user, passwd, database, table):
+        InfluxClient.__init__(self, host, user, passwd, database, table)
+
+    def setup(self):
+        self._open_connection();
+
+    def configure(self):
+        try:
+            self.setup()
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                infmsg('InfluxDB: creating database %s' % self.db_database)
+                self.conn.create_database(self.db_database);
+                # no need to create table (in influxdb, callled 'measurement')
+                
+        finally:
+            self.cleanup()
+
+
 class SqliteClient(object):
     def __init__(self, filename, table):
         if not sqlite:
@@ -4172,6 +4270,7 @@ if __name__ == '__main__':
 
     group = optparse.OptionGroup(parser, 'database setup options')
     group.add_option('--mysql-config', action='store_true', default=False, help='configure mysql database')
+    group.add_option('--influx-config', action='store_true', default=False, help='configure influx database')
     group.add_option('--sqlite-config', action='store_true', default=False, help='configure sqlite database')
     parser.add_option_group(group)
 
@@ -4223,6 +4322,17 @@ if __name__ == '__main__':
     group.add_option('--mysql-table', help='database table', metavar='TABLE')
     group.add_option('--mysql-insert-period', help='database insert period in seconds', metavar='PERIOD')
     group.add_option('--mysql-persistent-connection', action='store_true', default=False, help='maintain a persistent connection to database')
+    parser.add_option_group(group)
+    
+    group = optparse.OptionGroup(parser, 'influxdb options')
+    group.add_option('--influx', action='store_true', dest='influx_out', default=False, help='write data to influx database')
+    group.add_option('--influx-host', help='database host', metavar='HOSTNAME')
+    group.add_option('--influx-user', help='database user', metavar='USERNAME')
+    group.add_option('--influx-passwd', help='database password', metavar='PASSWORD')
+    group.add_option('--influx-database', help='database name', metavar='DATABASE')
+    group.add_option('--influx-table', help='database table', metavar='TABLE')
+    group.add_option('--influx-insert-period', help='database insert period in seconds', metavar='PERIOD')
+    group.add_option('--influx-persistent-connection', action='store_true', default=False, help='maintain a persistent connection to database')
     parser.add_option_group(group)
 
     group = optparse.OptionGroup(parser, 'sqlite options')
@@ -4500,6 +4610,14 @@ if __name__ == '__main__':
                                 options.sqlite_table or dbtable)
         db.configure()
         sys.exit(0)
+    if options.influx_config:
+        db = InfluxConfigurator(options.influx_host or DB_HOST,
+                                options.influx_user or DB_USER,
+                                options.influx_passwd or DB_PASSWD,
+                                options.influx_database or DB_DATABASE,
+                                options.influx_table or dbtable)
+        db.configure()
+        sys.exit(0)
 
     # Data Collector setup
     if options.serial_read:
@@ -4542,6 +4660,14 @@ if __name__ == '__main__':
                               options.sqlite_src_table or dbtable,
                               options.sqlite_poll_interval or DB_POLL_INTERVAL)
 
+    elif options.influx_read:
+        col = InfluxCollector(options.influx_src_host or DB_HOST,
+                              options.influx_src_user or DB_USER,
+                              options.influx_src_passwd or DB_PASSWD,
+                              options.influx_src_database or DB_DATABASE,
+                              options.influx_src_table or dbtable,
+                              options.influx_poll_interval or DB_POLL_INTERVAL)
+
     elif options.rrd_read:
         col = RRDCollector(options.rrd_src_dir or RRD_DIR,
                            options.rrd_src_step or RRD_STEP,
@@ -4557,7 +4683,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # Packet Processor Setup
-    if not (options.print_out or options.mysql_out or options.sqlite_out or
+    if not (options.print_out or options.mysql_out or options.sqlite_out or options.influx_out or 
             options.rrd_out or options.wattzon_out or options.plotwatt_out or
             options.enersave_out or options.bidgely_out or
             options.peoplepower_out or options.eragy_out or
@@ -4568,6 +4694,7 @@ if __name__ == '__main__':
         print '  --print              print to screen'
         print '  --mysql              write to mysql database'
         print '  --sqlite             write to sqlite database'
+        print '  --influx             write to influx database'
         print '  --rrd                write to round-robin database'
         print '  --bidgely            upload to Bidgely'
         print '  --enersave           upload to EnerSave (deprecated)'
@@ -4602,6 +4729,15 @@ if __name__ == '__main__':
                      (options.sqlite_file or DB_FILENAME,
                       options.sqlite_table or dbtable,
                       options.sqlite_insert_period or DB_INSERT_PERIOD))
+    if options.influx_out:
+        procs.append(InfluxProcessor
+                     (options.influx_host or DB_HOST,
+                      options.influx_user or DB_USER,
+                      options.influx_passwd or DB_PASSWD,
+                      options.influx_database or DB_DATABASE,
+                      options.influx_table or dbtable,
+                      options.influx_insert_period or DB_INSERT_PERIOD,
+                      options.influx_persistent_connection or False))
     if options.rrd_out:
         procs.append(RRDProcessor
                      (options.rrd_dir or RRD_DIR,
