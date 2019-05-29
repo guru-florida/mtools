@@ -1233,7 +1233,7 @@ except ImportError:
 try:
     from influxdb import InfluxDBClient
 except ImportError:
-    influxdb = None
+    InfluxDBClient = None
     
 try:
     from sqlite3 import dbapi2 as sqlite
@@ -2917,7 +2917,7 @@ class MySQLConfigurator(MySQLClient):
 
 class InfluxClient(object):
     def __init__(self, host, user, passwd, database, table):
-        if not influxdb:
+        if not InfluxDBClient:
             print 'InfluxDB Error: InfluxDB module could not be imported.'
             sys.exit(1)
 
@@ -2935,7 +2935,7 @@ class InfluxClient(object):
 
     def _open_connection(self):
         dbgmsg('InfluxDB: opening connection to %s' % self.db_host)
-        self.conn = influxdb.InfluxDBClient(host=self.db_host, port=8086,
+        self.conn = InfluxDBClient(host=self.db_host, port=8086,
                                     username=self.db_user,
                                     password=self.db_passwd,
                                     database=self.db_database)
@@ -2954,10 +2954,52 @@ class InfluxClient(object):
 
 class InfluxProcessor(DatabaseProcessor, InfluxClient):
     def __init__(self, host, user, passwd, database, table, period,
+                 schemas='counters',
                  persistent_connection=False):
         DatabaseProcessor.__init__(self, table, period)
         InfluxClient.__init__(self, host, user, passwd, database, table)
         self._tbl = table
+        self._schemas = schemas.split(',');
+        self._chmap = {
+            "ch1": "Oven",
+            "ch2": "Pool",
+            "ch3": "Sprinkler",
+            "ch4": "Washer",
+            "ch5": "Microwave",
+            "ch6": "Fridge",
+            "ch7": "Kitchen1",
+            "ch8": "Kitchen2",
+            "ch9": "Dishwasher",
+            "ch11": "Outside",
+            "ch12": "Master",
+            "ch13": "Kitchen Lights",
+            "ch14": "Great Room",
+            "ch15": "Maya",
+            "ch16": "Office",
+            "ch20": "Lanai",
+            "ch22": "Dryer",
+            "ch23": "AH East",
+            "ch24": "AC East",
+            "ch29": "AH West",
+            "ch30": "AC West",
+            "ch32": "Main",
+            "t1": "Garage",
+            "t2": "Attic",
+            "t3": "AC West Return",
+            "t4": "AC West Plenum"
+        }
+        #self._channels = 'ch1,ch2,ch3,ch32'.split(',');
+        self._channels = [ ch for ch in self._chmap.keys() if ch.startswith('ch') ]
+        # TODO: use FILTER_PE_LABELS which has all the channel names
+        self._channels.extend('ch10,ch11,ch12,ch13,ch14,ch15,ch17,ch18,ch19,ch20,ch21'.split(','));
+        self._write_aws = True;
+        self._write_pws = False;
+        self._write_w = True;
+        self._write_wh = True;
+        self._write_volts = True;
+        self._write_volts_singleton = False;
+        self._write_unknown_sensors = False;
+        self._write_pulses = False;
         self._persistent_connection = persistent_connection
         infmsg('InfluxDB: process_period: %d' % self.process_period)
 
@@ -2971,20 +3013,107 @@ class InfluxProcessor(DatabaseProcessor, InfluxClient):
         if self._persistent_connection:
             InfluxClient.cleanup(self)
 
+    def _get_counters(self, p):
+        measurements = [];
+        if self._write_aws or self.write_pws:
+            for c in self._channels:
+                label = self._chmap.get(c, c);
+                meas = {
+                    "measurement": 'counters',
+                    "tags": {
+                        "channel": label,
+                    },
+                    "time": int(p['time_created']),
+                    "fields": {}
+                }
+                if self._write_volts: meas['fields']['volts'] = p['volts']
+                if self._write_aws: meas['fields']['aws'] = p[c+'_aws']
+                if self._write_pws: meas['fields']['pws'] = p[c+'_pws']
+                measurements.append(meas);
+        if self._write_volts_singleton:
+                meas = {
+                    "measurement": 'energy',
+                    "time": p['time_created'],
+                    "fields": { "volts": p['volts'] }
+                }
+                measurements.append(meas)
+        return measurements
+
+    def _get_ecmreadext(self, p):
+        measurements = [];
+        if self._write_w or self.write_wh:
+            for c in self._channels:
+                label = self._chmap.get(c, c);
+                meas = {
+                    "measurement": 'energy',
+                    "tags": {
+                        "channel": label,
+                    },
+                    "time": int(p['time_created']),
+                    "fields": {}
+                }
+                if self._write_volts: meas['fields']['volts'] = p['volts']
+                if self._write_w: meas['fields']['w'] = p[c+'_w']
+                if self._write_wh: meas['fields']['wh'] = p[c+'_wh']
+                measurements.append(meas);
+        if self._write_volts_singleton:
+                meas = {
+                    "measurement": 'energy',
+                    "time": p['time_created'],
+                    "fields": { "volts": p['volts'] }
+                }
+                measurements.append(meas)
+        return measurements
+
+    def _get_sensors(self, p):
+        measurements = [];
+        for c in PACKET_FORMAT.channels(FILTER_SENSOR):
+            label = self._chmap.get(c, c if self._write_unknown_sensors else None)
+            if label != None:
+                # print "sensor[%s] = '%d'" % (label,p[c])
+                meas = {
+                    "measurement": 'sensors',
+                    "tags": {
+                        "channel": label,
+                    },
+                    "time": int(p['time_created']),
+                    "fields": { "value": p[c] }
+                }
+                measurements.append(meas);
+        return measurements
+
+    def _insert_packets(self, packets):
+        measurements = []
+        for p in packets:
+            sn = p['serial']
+            ts = p['time_created']
+            if 'counters' in self._schemas:
+                pm = self._get_counters(p)
+                measurements.extend(pm);
+            if 'ecmreadext' in self._schemas:
+                pm = self._get_ecmreadext(p)
+                measurements.extend(pm);
+            if 'sensors' in self._schemas:
+                pm = self._get_sensors(p)
+                measurements.extend(pm);
+        #print "InfluxDB: writing points %s\n" % measurements;
+        self.conn.write_points(measurements, database=self.db_database, time_precision='s');
+        infmsg('InfluxDB: sent %d measurements for D%s @ %s' % (len(measurements), sn, ts))
+
     def process_calculated(self, packets):
         try:
             if not self._persistent_connection:
                 InfluxClient.setup(self)
-            DatabaseProcessor.process_calculated(self, packets)
+            self._insert_packets(packets);
         finally:
             if not self._persistent_connection:
                 InfluxClient.cleanup(self)
 
-    def handle(self, e):
-        if type(e) == influxdb.Error:
-            errmsg('InfluxDB Error: [#%d] %s' % (e.args[0], e.args[1]))
-            return True
-        return super(InfluxProcessor, self).handle(e)
+    #def handle(self, e):
+    #    if type(e) == InfluxDBClient.Error:
+    #        errmsg('InfluxDB Error: [#%d] %s' % (e.args[0], e.args[1]))
+    #        return True
+    #    return super(InfluxProcessor, self).handle(e)
 
 
 class InfluxConfigurator(InfluxClient):
@@ -4330,6 +4459,7 @@ if __name__ == '__main__':
     group.add_option('--influx-user', help='database user', metavar='USERNAME')
     group.add_option('--influx-passwd', help='database password', metavar='PASSWORD')
     group.add_option('--influx-database', help='database name', metavar='DATABASE')
+    group.add_option('--influx-schemas', help='schemas selected to be written', metavar='SCHEMAS')
     group.add_option('--influx-table', help='database table', metavar='TABLE')
     group.add_option('--influx-insert-period', help='database insert period in seconds', metavar='PERIOD')
     group.add_option('--influx-persistent-connection', action='store_true', default=False, help='maintain a persistent connection to database')
@@ -4737,6 +4867,7 @@ if __name__ == '__main__':
                       options.influx_database or DB_DATABASE,
                       options.influx_table or dbtable,
                       options.influx_insert_period or DB_INSERT_PERIOD,
+                      options.influx_schemas or DB_SCHEMA_COUNTERS,
                       options.influx_persistent_connection or False))
     if options.rrd_out:
         procs.append(RRDProcessor
